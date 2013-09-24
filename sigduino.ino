@@ -4,7 +4,7 @@
   This example code is in the public domain.
   Share, it's happiness !
 
-  Note : average consumption 35 ma on 12VDC. (TODO update this !)
+  Note : average consumption 20 ma on 12VDC. (TODO update this !)
   With card(s) : OLIMEXINO-328 (! 3,3VDC select !)
                  TD1208 UNB modem on eval board (TD1208 EVB)
                  Adafruit ADS1015 board (I2C 12-bits ADC)
@@ -16,13 +16,13 @@
 #include <SoftwareSerial.h>
 #include <avr/power.h>
 #include <avr/sleep.h>
-#include <Timer.h>
+//#include <Timer.h>
 #include <Adafruit_ADS1015.h>
 
 // some prototypes
-void job1();
-void jobModem();
+void read_current(void);
 void sig_send_var(uint8_t id_var, uint32_t var);
+void do_sleep(void);
 uint32_t bswap_32 (uint32_t x);
 uint16_t bswap_16(uint16_t x);
 
@@ -43,9 +43,7 @@ union payload_t
 
 // some vars
 SoftwareSerial modem(2, 3); // RX, TX
-Timer t;
-int job_1;
-int job_modem;
+uint32_t tick_8s = 0;
 Adafruit_ADS1015 ads1015;  	// ads1015 at default I2C address: 0x48
 
 
@@ -54,6 +52,12 @@ Adafruit_ADS1015 ads1015;  	// ads1015 at default I2C address: 0x48
 static FILE console_out = {0};
 // create a FILE structure to reference our UNB modem
 static FILE modem_out = {0};
+
+// *** ISR ***
+ISR(WDT_vect)
+{
+  // do nothing
+}
 
 // create serial outputs functions
 // This works because Serial.write, although of
@@ -72,11 +76,17 @@ static int modem_putchar (char c, FILE *stream)
 
 void setup()
 {
+  // wait 10s before start
+  delay(10000);
+  // reduce power : disable uC ADC (enable by arduino core)
+  ADCSRA = 0x00;
   // IO setup
   pinMode(TEST_LED, OUTPUT);
   digitalWrite(TEST_LED, LOW);
   // init external ADC
   ads1015.begin();
+  // 16x gain  +/- 0.256V  1 bit = 0.125mV
+  ads1015.setGain(GAIN_SIXTEEN);  
   // open serial communications, link Serial to stdio lib
   Serial.begin(9600);
   // set the data rate for the SoftwareSerial port
@@ -88,41 +98,68 @@ void setup()
   // standard output device STDOUT is console
   stdout = &console_out;
   // init job (with Timer lib)
-  job_1      = t.every(1000, job1);
-  job1();
+  //job_1      = t.every(1000, job1);
+  //job1();
   // init job (with Timer lib)
-  job_modem  = t.every(3600000, jobModem);
-  jobModem();
+  //job_modem  = t.every(3600000, jobModem);
+  //jobModem();
+  // *** Setup the watch dog timer ***
+  // Clear the reset flag
+  MCUSR &= ~(1<<WDRF);
+  /* In order to change WDE or the prescaler, we need to
+  * set WDCE (This will allow updates for 4 clock cycles).
+  */
+  WDTCSR |= (1<<WDCE) | (1<<WDE);
+  /* set new watchdog timeout prescaler value */
+  WDTCSR = 1<<WDP0 | 1<<WDP3; /* 8.0 seconds */
+  /* Enable the WD interrupt (note no reset). */
+  WDTCSR |= _BV(WDIE);
 }
 
 void loop()
 { 
-  t.update();
+  read_current();
+  //fprintf_P(&console_out, PSTR("millis=%lu\r\n"), millis());
+  // call this job every 100 * 8s (800s) 
+  if (tick_8s % 100 == 0) 
+  {
+    if (tick_8s == 0)
+      sig_send_var(1, 0xFFFFFFFF);
+    else
+      sig_send_var(1, tick_8s); 
+    delay(100);  // TODO wait on IDLE mode 
+  }
+  // wait for serial event
+  delay(50);  // TODO wait on IDLE mode 
+  // sleep now...
+  do_sleep();
+  // update tick
+  tick_8s++;
 }
 
-// job "modem"
-void job1(void)
+void read_current(void)
 {
-  fprintf_P(&console_out, PSTR("millis()=%lu\r\n"), millis());
-}
-
-// job "modem"
-void jobModem(void)
-{
-  sig_send_var(1, millis());
+  int16_t result; 
+  result = ads1015.readADC_Differential_0_1();
+  // two's complement for 12 bits
+  if (result >= 0x0800)
+    result = - ((~result & 0x07FF) + 1);
+  // to mV (1 bit -> 0,125 mv | 0,125 mv -> 12,5 ma)
+  result *=  12.5;
+  fprintf_P(&console_out, PSTR("current= %d ma\r\n"), result);
 }
 
 void sig_send_var(uint8_t id_var, uint32_t var)
 {
   payload_t frame;
-  char buffer[40];
+  char buffer[30];
   // init var
   memset(&frame, 0, sizeof(frame));
   // set frame field
   frame.msg_type = 0x01;
   frame.id_var   = id_var;
   frame.var      = bswap_32(var);
-  // format hex string (ex : 01 01 fe 5e c8 99 00 00...)
+  // format hex string (ex : 0101fe5ec8990000...)
   strcpy_P(buffer, PSTR(""));
   uint8_t i = 0;
   char digits[3];
@@ -136,6 +173,22 @@ void sig_send_var(uint8_t id_var, uint32_t var)
   fprintf_P(&console_out, PSTR("AT$RAW=%s\r\n"), buffer); // copy for debug
 }
 
+/*** sleep routine ***/ 
+void do_sleep(void)
+{
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN); // sleep mode is set here
+  cli();
+  sleep_enable();
+  // disable BOD during sleep (auto-reset after wake-up)
+  sleep_bod_disable();
+  sei();
+  // !!! system sleeps here
+  sleep_mode();
+  // system continues execution here (after watchdog timed out)
+  sleep_disable();
+}
+
+/*
 // set uc on idle mode (for power saving) with some subsystem disable
 // don't disable timer0 use for millis()
 // timer0 overflow ISR occur every 256 x 64 clock cyle
@@ -161,7 +214,7 @@ void delay_idle(unsigned long ms)
   while (millis() - _now < ms)
     cpu_idle();
 }
-
+*/
 
 // *** swap byte order function for 32 and 16 bits ***
 uint32_t bswap_32(uint32_t x)
