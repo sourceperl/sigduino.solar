@@ -4,7 +4,7 @@
   This example code is in the public domain.
   Share, it's happiness !
 
-  Note : average consumption 20 ma on 12VDC. (TODO update this !)
+  Note : average consumption 8 ma on 12VDC. (TODO update this !)
   With card(s) : OLIMEXINO-328 (! 3,3VDC select !)
                  TD1208 UNB modem on eval board (TD1208 EVB)
                  Adafruit ADS1015 board (I2C 12-bits ADC)
@@ -46,7 +46,6 @@ SoftwareSerial modem(2, 3); // RX, TX
 uint32_t tick_8s = 0;
 Adafruit_ADS1015 ads1015;  	// ads1015 at default I2C address: 0x48
 
-
 // link stdout (printf) to Serial object
 // create a FILE structure to reference our UART
 static FILE console_out = {0};
@@ -78,14 +77,12 @@ void setup()
 {
   // wait 10s before start
   delay(10000);
-  // reduce power : disable uC ADC (enable by arduino core)
-  ADCSRA = 0x00;
   // IO setup
   pinMode(TEST_LED, OUTPUT);
   digitalWrite(TEST_LED, LOW);
   // init external ADC
   ads1015.begin();
-  // 16x gain  +/- 0.256V  1 bit = 0.125mV
+  // 16x gain  +/- 0.256V (max voltage) 1 bit = 0.125mV
   ads1015.setGain(GAIN_SIXTEEN);  
   // open serial communications, link Serial to stdio lib
   Serial.begin(9600);
@@ -97,12 +94,6 @@ void setup()
   fdev_setup_stream(&modem_out,   modem_putchar,   NULL, _FDEV_SETUP_WRITE);
   // standard output device STDOUT is console
   stdout = &console_out;
-  // init job (with Timer lib)
-  //job_1      = t.every(1000, job1);
-  //job1();
-  // init job (with Timer lib)
-  //job_modem  = t.every(3600000, jobModem);
-  //jobModem();
   // *** Setup the watch dog timer ***
   // Clear the reset flag
   MCUSR &= ~(1<<WDRF);
@@ -176,7 +167,10 @@ void sig_send_var(uint8_t id_var, uint32_t var)
 /*** sleep routine ***/ 
 void do_sleep(void)
 {
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN); // sleep mode is set here
+  // disable uC ADC (enable by arduino core)
+  ADCSRA &= ~(1 << ADEN);
+  // sleep mode is set here
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   cli();
   sleep_enable();
   // disable BOD during sleep (auto-reset after wake-up)
@@ -186,6 +180,8 @@ void do_sleep(void)
   sleep_mode();
   // system continues execution here (after watchdog timed out)
   sleep_disable();
+  // enable uC ADC
+  ADCSRA |= (1 << ADEN);
 }
 
 /*
@@ -237,5 +233,3 @@ uint16_t bswap_16(uint16_t x)
 {
   return ((((x) >> 8) & 0xff) | (((x) & 0xff) << 8));
 }
-
-    
