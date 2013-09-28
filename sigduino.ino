@@ -4,10 +4,11 @@
   This example code is in the public domain.
   Share, it's happiness !
 
-  Note : average consumption 8 ma on 12VDC. (TODO update this !)
-  With card(s) : OLIMEXINO-328 (! 3,3VDC select !)
+  Note : average consumption 120 ua under 3 VDC with all modules
+  With card(s) : ATmega328 bootloader ATmegaBOOT_168_atmega328_pro_8MHz
                  TD1208 UNB modem on eval board (TD1208 EVB)
-                 Adafruit ADS1015 board (I2C 12-bits ADC)
+                 //Adafruit ADS1015 board (I2C 12-bits ADC)
+                 for the moment with BMP085 pressure sensor (for test purpose)
 */
 
 /* library */
@@ -16,13 +17,15 @@
 #include <SoftwareSerial.h>
 #include <avr/power.h>
 #include <avr/sleep.h>
-//#include <Timer.h>
-#include <Adafruit_ADS1015.h>
+//#include <Adafruit_ADS1015.h>
+#include <Adafruit_BMP085.h>
 
 // some prototypes
 void read_current(void);
 void sig_send_var(uint8_t id_var, uint32_t var);
-void do_sleep(void);
+void cpu_sleep(void);
+void cpu_idle(void);
+void delay_idle(unsigned long ms);
 uint32_t bswap_32 (uint32_t x);
 uint16_t bswap_16(uint16_t x);
 
@@ -44,7 +47,10 @@ union payload_t
 // some vars
 SoftwareSerial modem(2, 3); // RX, TX
 uint32_t tick_8s = 0;
-Adafruit_ADS1015 ads1015;  	// ads1015 at default I2C address: 0x48
+Adafruit_BMP085 bmp;
+uint32_t p_alt0_max;
+uint32_t p_alt0_min;
+//Adafruit_ADS1015 ads1015;  	// ads1015 at default I2C address: 0x48
 
 // link stdout (printf) to Serial object
 // create a FILE structure to reference our UART
@@ -75,25 +81,56 @@ static int modem_putchar (char c, FILE *stream)
 
 void setup()
 {
-  // wait 10s before start
-  delay(10000);
   // IO setup
   pinMode(TEST_LED, OUTPUT);
   digitalWrite(TEST_LED, LOW);
   // init external ADC
-  ads1015.begin();
+  //ads1015.begin();
   // 16x gain  +/- 0.256V (max voltage) 1 bit = 0.125mV
-  ads1015.setGain(GAIN_SIXTEEN);  
+  //ads1015.setGain(GAIN_SIXTEEN);  
   // open serial communications, link Serial to stdio lib
   Serial.begin(9600);
   // set the data rate for the SoftwareSerial port
   modem.begin(9600);
-  modem.setTimeout(5000);
+  //modem.setTimeout(5000);
   // fill in the UART file descriptor with pointer to writer
   fdev_setup_stream(&console_out, console_putchar, NULL, _FDEV_SETUP_WRITE);
   fdev_setup_stream(&modem_out,   modem_putchar,   NULL, _FDEV_SETUP_WRITE);
   // standard output device STDOUT is console
   stdout = &console_out;
+  // set reroute (console <-> UNB modem) ?
+  fprintf_P(&console_out, PSTR("PRESS \"x\" key to reroute to UNB modem (wait 5s)\r\n"));
+  // wait 5s
+  delay_idle(5000); 
+  // check user choice
+  if (Serial.read() == 'x') 
+  {
+    // debug mode : reroute console to UNB modem
+    fprintf_P(&console_out, PSTR("reroute to UNB modem (reset board to exit this mode)\r\n"));
+    while (1) 
+    {
+      // read from port 0, send to port 1:
+      if (Serial.available()) 
+        modem.write(Serial.read());
+      // read from port 1, send to port 0:
+      if (modem.available())      
+        Serial.write(modem.read());
+    }
+  } else {
+    // startup message
+    fprintf_P(&console_out, PSTR("system start\r\n"));
+  }
+  // start BMP085
+  if (! bmp.begin()) {
+	  fprintf_P(&console_out, PSTR("could not find a valid BMP085 sensor, check wiring\r\n"));
+	  while (1) {}
+  }
+  // reset UNB modem
+  fprintf_P(&modem_out, PSTR("ATZ\r"));
+  delay_idle(1500);
+  // init some vars
+  p_alt0_max = 0;
+  p_alt0_min = 0xFFFFFFFF;
   // *** Setup the watch dog timer ***
   // Clear the reset flag
   MCUSR &= ~(1<<WDRF);
@@ -105,29 +142,42 @@ void setup()
   WDTCSR = 1<<WDP0 | 1<<WDP3; /* 8.0 seconds */
   /* Enable the WD interrupt (note no reset). */
   WDTCSR |= _BV(WDIE);
+  // DEBUG: help to send SIGFOX frame
+  fprintf_P(&console_out, PSTR("write 's' to console to send SIGFOX frame\r\n"));
+  delay_idle(50);
 }
 
 void loop()
 { 
-  read_current();
-  //fprintf_P(&console_out, PSTR("millis=%lu\r\n"), millis());
-  // call this job every 100 * 8s (800s) 
-  if (tick_8s % 100 == 0) 
+  int16_t temp;
+  uint16_t pressure_alt0;
+  fprintf_P(&console_out, PSTR("tick=%i\r\n"), tick_8s);
+  delay_idle(20);
+  // call this job every 1 * 8s (8s) 
+  if (tick_8s % 1 == 0)   
   {
-    if (tick_8s == 0)
-      sig_send_var(1, 0xFFFFFFFF);
-    else
-      sig_send_var(1, tick_8s); 
-    delay(100);  // TODO wait on IDLE mode 
+    temp = bmp.readTemperature() * 10;
+    // 0,9... = const for 19 m 
+    // see http://fr.wikipedia.org/wiki/Atmosph%C3%A8re_normalis%C3%A9e#Atmosph.C3.A8re_type_OACI)
+    //fprintf_P(&console_out, PSTR("p=%u, t=%i\r\n"), pressure_alt0, temp); // copy for debug
+    // write 's' to console to send SIGFOX frame
+    if (Serial.read() == 's')
+    {
+      // send frame
+      sig_send_var(2, temp);
+      // flush buffer
+      while(Serial.read() > 0);
+    }
+    // wait for serial event
+    //delay_idle(20);
   }
-  // wait for serial event
-  delay(50);  // TODO wait on IDLE mode 
   // sleep now...
-  do_sleep();
+  cpu_sleep();
   // update tick
   tick_8s++;
 }
 
+/*
 void read_current(void)
 {
   int16_t result; 
@@ -139,7 +189,7 @@ void read_current(void)
   result *=  12.5;
   fprintf_P(&console_out, PSTR("current= %d ma\r\n"), result);
 }
-
+*/
 void sig_send_var(uint8_t id_var, uint32_t var)
 {
   payload_t frame;
@@ -149,7 +199,7 @@ void sig_send_var(uint8_t id_var, uint32_t var)
   // set frame field
   frame.msg_type = 0x01;
   frame.id_var   = id_var;
-  frame.var      = bswap_32(var);
+  frame.var      = bswap_16(var);
   // format hex string (ex : 0101fe5ec8990000...)
   strcpy_P(buffer, PSTR(""));
   uint8_t i = 0;
@@ -162,10 +212,11 @@ void sig_send_var(uint8_t id_var, uint32_t var)
   // send command
   fprintf_P(&modem_out, PSTR("AT$RAW=%s\r"), buffer);
   fprintf_P(&console_out, PSTR("AT$RAW=%s\r\n"), buffer); // copy for debug
+  delay_idle(100);
 }
 
 /*** sleep routine ***/ 
-void do_sleep(void)
+void cpu_sleep(void)
 {
   // disable uC ADC (enable by arduino core)
   ADCSRA &= ~(1 << ADEN);
@@ -184,7 +235,7 @@ void do_sleep(void)
   ADCSRA |= (1 << ADEN);
 }
 
-/*
+
 // set uc on idle mode (for power saving) with some subsystem disable
 // don't disable timer0 use for millis()
 // timer0 overflow ISR occur every 256 x 64 clock cyle
@@ -210,7 +261,7 @@ void delay_idle(unsigned long ms)
   while (millis() - _now < ms)
     cpu_idle();
 }
-*/
+
 
 // *** swap byte order function for 32 and 16 bits ***
 uint32_t bswap_32(uint32_t x)
