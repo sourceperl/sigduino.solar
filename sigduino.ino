@@ -7,8 +7,7 @@
   Note : average consumption 120 ua under 3 VDC with all modules
   With card(s) : ATmega328 bootloader ATmegaBOOT_168_atmega328_pro_8MHz
                  TD1208 UNB modem on eval board (TD1208 EVB)
-                 //Adafruit ADS1015 board (I2C 12-bits ADC)
-                 for the moment with BMP085 pressure sensor (for test purpose)
+                 Adafruit ADS1015 board (I2C 12-bits ADC)
 */
 
 /* library */
@@ -17,17 +16,7 @@
 #include <SoftwareSerial.h>
 #include <avr/power.h>
 #include <avr/sleep.h>
-//#include <Adafruit_ADS1015.h>
-#include <Adafruit_BMP085.h>
-
-// some prototypes
-void read_current(void);
-void sig_send_var(uint8_t id_var, uint32_t var);
-void cpu_sleep(void);
-void cpu_idle(void);
-void delay_idle(unsigned long ms);
-uint32_t bswap_32 (uint32_t x);
-uint16_t bswap_16(uint16_t x);
+#include <Adafruit_ADS1015.h>
 
 // some const
 #define TEST_LED 13
@@ -39,18 +28,40 @@ union payload_t
   {
     uint8_t msg_type;
     uint8_t id_var;
-    uint32_t var;
+    int16_t var_max;
+    int16_t var_avg;
+    int16_t var_min;
   };
   uint8_t byte[10];
 };
 
+struct stat_t
+{
+  int16_t  val;
+  int16_t  min;
+  int16_t  max;
+  int16_t  avg;
+  int32_t  avg_sum;
+  uint16_t avg_count;
+};
+
+// some prototypes
+int16_t read_current(void);
+void update_stat(stat_t *_stat_t);
+void reset_stat(stat_t *_stat_t);
+void sig_send_stat(uint8_t id_var, stat_t *_stat_t);
+void cpu_sleep(void);
+void cpu_idle(void);
+void delay_idle(unsigned long ms);
+uint32_t bswap_32 (uint32_t x);
+uint16_t bswap_16(uint16_t x);
+
 // some vars
 SoftwareSerial modem(2, 3); // RX, TX
-uint32_t tick_8s = 0;
-Adafruit_BMP085 bmp;
-uint32_t p_alt0_max;
-uint32_t p_alt0_min;
-//Adafruit_ADS1015 ads1015;  	// ads1015 at default I2C address: 0x48
+Adafruit_ADS1015 ads1015;  	// ads1015 at default I2C address: 0x48
+stat_t i;
+uint32_t tick_8s   = 0;
+uint8_t debug_mode = 0;
 
 // link stdout (printf) to Serial object
 // create a FILE structure to reference our UART
@@ -84,10 +95,12 @@ void setup()
   // IO setup
   pinMode(TEST_LED, OUTPUT);
   digitalWrite(TEST_LED, LOW);
+  // init vars
+  reset_stat(&i);
   // init external ADC
-  //ads1015.begin();
+  ads1015.begin();
   // 16x gain  +/- 0.256V (max voltage) 1 bit = 0.125mV
-  //ads1015.setGain(GAIN_SIXTEEN);  
+  ads1015.setGain(GAIN_SIXTEEN);  
   // open serial communications, link Serial to stdio lib
   Serial.begin(9600);
   // set the data rate for the SoftwareSerial port
@@ -99,11 +112,25 @@ void setup()
   // standard output device STDOUT is console
   stdout = &console_out;
   // set reroute (console <-> UNB modem) ?
-  fprintf_P(&console_out, PSTR("PRESS \"x\" key to reroute to UNB modem (wait 5s)\r\n"));
-  // wait 5s
-  delay_idle(5000); 
-  // check user choice
-  if (Serial.read() == 'x') 
+  fprintf_P(&console_out, PSTR("PRESS \"r\" key to reroute to UNB modem\r\n"));
+  fprintf_P(&console_out, PSTR("PRESS \"d\" key to set debug mode\r\n"));
+  fprintf_P(&console_out, PSTR("wait 4s...\r\n"));
+  uint8_t k_loop = 0;
+  char key;
+  while (k_loop++ < 4)
+  {
+    delay_idle(1000);
+    key = Serial.read();
+    if (key != -1) break;
+  }
+  // check user choice : debug
+  if (key == 'd')
+  {
+    debug_mode = 1;
+    fprintf_P(&console_out, PSTR("debug mode on\r\n"));
+  }
+  // check user choice : reroute
+  else if (key == 'r') 
   {
     // debug mode : reroute console to UNB modem
     fprintf_P(&console_out, PSTR("reroute to UNB modem (reset board to exit this mode)\r\n"));
@@ -120,17 +147,9 @@ void setup()
     // startup message
     fprintf_P(&console_out, PSTR("system start\r\n"));
   }
-  // start BMP085
-  if (! bmp.begin()) {
-	  fprintf_P(&console_out, PSTR("could not find a valid BMP085 sensor, check wiring\r\n"));
-	  while (1) {}
-  }
   // reset UNB modem
   fprintf_P(&modem_out, PSTR("ATZ\r"));
-  delay_idle(1500);
-  // init some vars
-  p_alt0_max = 0;
-  p_alt0_min = 0xFFFFFFFF;
+  delay_idle(4000);
   // *** Setup the watch dog timer ***
   // Clear the reset flag
   MCUSR &= ~(1<<WDRF);
@@ -142,34 +161,25 @@ void setup()
   WDTCSR = 1<<WDP0 | 1<<WDP3; /* 8.0 seconds */
   /* Enable the WD interrupt (note no reset). */
   WDTCSR |= _BV(WDIE);
-  // DEBUG: help to send SIGFOX frame
-  fprintf_P(&console_out, PSTR("write 's' to console to send SIGFOX frame\r\n"));
-  delay_idle(50);
 }
 
 void loop()
 { 
-  int16_t temp;
-  uint16_t pressure_alt0;
-  fprintf_P(&console_out, PSTR("tick=%i\r\n"), tick_8s);
-  delay_idle(20);
-  // call this job every 1 * 8s (8s) 
-  if (tick_8s % 1 == 0)   
+  // read I (current) on shunt
+  i.val = read_current();
+  update_stat(&i);
+  // debug mode
+  if (debug_mode)
   {
-    temp = bmp.readTemperature() * 10;
-    // 0,9... = const for 19 m 
-    // see http://fr.wikipedia.org/wiki/Atmosph%C3%A8re_normalis%C3%A9e#Atmosph.C3.A8re_type_OACI)
-    //fprintf_P(&console_out, PSTR("p=%u, t=%i\r\n"), pressure_alt0, temp); // copy for debug
-    // write 's' to console to send SIGFOX frame
-    if (Serial.read() == 's')
-    {
-      // send frame
-      sig_send_var(2, temp);
-      // flush buffer
-      while(Serial.read() > 0);
-    }
-    // wait for serial event
-    //delay_idle(20);
+    fprintf_P(&console_out, PSTR("current= %d ma (max %d, avg %d, min %d)\r\n"), i.val, i.max, i.avg, i.min);
+    // need for UART delay
+    delay_idle(100);
+  }
+  // call this job every 100 * 8s (800s) 
+  if (tick_8s % 100 == 0)
+  {
+    sig_send_stat(1, &i);
+    reset_stat(&i);
   }
   // sleep now...
   cpu_sleep();
@@ -177,20 +187,46 @@ void loop()
   tick_8s++;
 }
 
-/*
-void read_current(void)
+
+int16_t read_current(void)
 {
-  int16_t result; 
-  result = ads1015.readADC_Differential_0_1();
+  int16_t _r_current; 
+  _r_current = ads1015.readADC_Differential_0_1();
   // two's complement for 12 bits
-  if (result >= 0x0800)
-    result = - ((~result & 0x07FF) + 1);
-  // to mV (1 bit -> 0,125 mv | 0,125 mv -> 12,5 ma)
-  result *=  12.5;
-  fprintf_P(&console_out, PSTR("current= %d ma\r\n"), result);
+  if (_r_current >= 0x0800)
+    _r_current = - ((~_r_current & 0x07FF) + 1);
+  // to mV (1 bit -> 0,125 mv) for shunt = 0.01 ohms (0,125 mv -> 12,5 ma)
+  _r_current *=  12.5;
+  return _r_current;
 }
-*/
-void sig_send_var(uint8_t id_var, uint32_t var)
+
+void update_stat(stat_t *_stat_t)
+{
+  // first update ?
+  if (_stat_t->avg_count == 0)
+    _stat_t->min = _stat_t->max = _stat_t->val;
+  // is min ?
+  else if (_stat_t->val < _stat_t->min)
+    _stat_t->min = _stat_t->val;
+  // is max ?
+  else if (_stat_t->val > _stat_t->max)
+    _stat_t->max = _stat_t->val;
+  // average compute
+  _stat_t->avg_sum += _stat_t->val;
+  _stat_t->avg_count++;
+  _stat_t->avg = _stat_t->avg_sum/_stat_t->avg_count;
+}
+
+void reset_stat(stat_t *_stat_t)
+{
+  _stat_t->min       = 0;
+  _stat_t->max       = 0;
+  _stat_t->avg       = 0;
+  _stat_t->avg_count = 0;
+  _stat_t->avg_sum   = 0;
+}
+
+void sig_send_stat(uint8_t id_var, stat_t *_stat_t)
 {
   payload_t frame;
   char buffer[30];
@@ -199,7 +235,9 @@ void sig_send_var(uint8_t id_var, uint32_t var)
   // set frame field
   frame.msg_type = 0x01;
   frame.id_var   = id_var;
-  frame.var      = bswap_16(var);
+  frame.var_max  = bswap_16(_stat_t->max);
+  frame.var_avg  = bswap_16(_stat_t->avg);
+  frame.var_min  = bswap_16(_stat_t->min);
   // format hex string (ex : 0101fe5ec8990000...)
   strcpy_P(buffer, PSTR(""));
   uint8_t i = 0;
@@ -211,8 +249,13 @@ void sig_send_var(uint8_t id_var, uint32_t var)
   } while(++i < sizeof(frame)); 
   // send command
   fprintf_P(&modem_out, PSTR("AT$RAW=%s\r"), buffer);
-  fprintf_P(&console_out, PSTR("AT$RAW=%s\r\n"), buffer); // copy for debug
-  delay_idle(100);
+  // time to flush tx buffer
+  delay_idle(50);
+  // debug message
+  if (debug_mode) {
+    fprintf_P(&console_out, PSTR("send \"AT$RAW=%s\"\r\n"), buffer);
+    delay_idle(50);
+  }
 }
 
 /*** sleep routine ***/ 
@@ -261,7 +304,6 @@ void delay_idle(unsigned long ms)
   while (millis() - _now < ms)
     cpu_idle();
 }
-
 
 // *** swap byte order function for 32 and 16 bits ***
 uint32_t bswap_32(uint32_t x)
