@@ -20,9 +20,12 @@
 
 // some const
 #define TEST_LED 13
+#define MSG_T_REGISTER 0x01
+#define MSG_T_STAT     0x02
+#define MSG_T_INDEX    0x03
 
 // some types
-union payload_t 
+union stat_payload_t 
 {
   struct
   {
@@ -31,6 +34,19 @@ union payload_t
     int16_t var_max;
     int16_t var_avg;
     int16_t var_min;
+    int16_t var_inst;
+  };
+  uint8_t byte[10];
+};
+
+union index_payload_t 
+{
+  struct
+  {
+    uint8_t  msg_type;
+    uint8_t  id_var;
+    uint32_t index_1;
+    uint32_t index_2;
   };
   uint8_t byte[10];
 };
@@ -46,10 +62,12 @@ struct stat_t
 };
 
 // some prototypes
-int16_t read_current(void);
+//int16_t read_current(void);
+//int16_t read_power(void);
 void update_stat(stat_t *_stat_t);
 void reset_stat(stat_t *_stat_t);
 void sig_send_stat(uint8_t id_var, stat_t *_stat_t);
+void sig_send_index(uint8_t id_var, uint32_t index_1, uint32_t index_2);
 void cpu_sleep(void);
 void cpu_idle(void);
 void delay_idle(unsigned long ms);
@@ -62,6 +80,8 @@ Adafruit_ADS1015 ads1015;  	// ads1015 at default I2C address: 0x48
 stat_t i;
 uint32_t tick_8s   = 0;
 uint8_t debug_mode = 0;
+uint32_t index_uah_gene = 0;
+uint32_t index_uah_cons = 0;
 
 // link stdout (printf) to Serial object
 // create a FILE structure to reference our UART
@@ -99,6 +119,8 @@ void setup()
   reset_stat(&i);
   // init external ADC
   ads1015.begin();
+  // 2x gain   +/- 2.048V (max voltage) 1 bit = 1mV
+  //ads1015.setGain(GAIN_TWO);
   // 16x gain  +/- 0.256V (max voltage) 1 bit = 0.125mV
   ads1015.setGain(GAIN_SIXTEEN);  
   // open serial communications, link Serial to stdio lib
@@ -165,39 +187,48 @@ void setup()
 
 void loop()
 { 
-  // read I (current) on shunt
-  i.val = read_current();
+  // read U on shunt
+  int16_t _u_mv = ads1015.readADC_Differential_0_1();
+  // two's complement for 12 bits
+  if (_u_mv >= 0x0800)
+    _u_mv = - ((~_u_mv & 0x07FF) + 1);
+  // compute _i in ua, current in 0R025 resistor ()
+  // _u is : 1 bit -> 0.125 mv
+  int32_t _i_ua =  (int32_t(_u_mv) * 0.125) * 1000 / 0.025;
+  // compute _i in ua, current in 10.5 resistor (_u is in mv : 1 bit -> 1 mv) 
+  //int32_t _i_ua =  int32_t(_u_mv) * 1000 / 10.5;
+  // set uah index
+  if (_i_ua > 0)
+    index_uah_gene += labs(_i_ua) * 8 / 3600;
+  else if (_i_ua < 0)
+    index_uah_cons += labs(_i_ua) * 8 / 3600;
+  // use i in ma for i stat
+  i.val = _i_ua / 1000;
   update_stat(&i);
   // debug mode
   if (debug_mode)
   {
-    fprintf_P(&console_out, PSTR("current= %d ma (max %d, avg %d, min %d)\r\n"), i.val, i.max, i.avg, i.min);
+    fprintf_P(&console_out, PSTR("index_gene= %lu uah/index_cons= %lu uah\r\n"),
+              index_uah_gene, index_uah_cons);
+    fprintf_P(&console_out, PSTR("current= %d ma (max %d, avg %d, min %d)\r\n"),
+              i.val, i.max, i.avg, i.min);
     // need for UART delay
     delay_idle(100);
   }
-  // call this job every 100 * 8s (800s) 
-  if (tick_8s % 100 == 0)
+  // send Sigfox frame
+  // send index: every 1h (450 * 8s = 3600s) 
+  if (tick_8s % 450 == 0)
+    sig_send_index(0x01, index_uah_gene, index_uah_cons);
+  // send I stat : every 3h (1350 * 8s) with a offset of 8s
+  if ((tick_8s + 1) % 1350 == 0)
   {
-    sig_send_stat(1, &i);
+    sig_send_stat(0x02, &i);
     reset_stat(&i);
   }
   // sleep now...
   cpu_sleep();
   // update tick
   tick_8s++;
-}
-
-
-int16_t read_current(void)
-{
-  int16_t _r_current; 
-  _r_current = ads1015.readADC_Differential_0_1();
-  // two's complement for 12 bits
-  if (_r_current >= 0x0800)
-    _r_current = - ((~_r_current & 0x07FF) + 1);
-  // to mV (1 bit -> 0,125 mv) for shunt = 0.01 ohms (0,125 mv -> 12,5 ma)
-  _r_current *=  12.5;
-  return _r_current;
 }
 
 void update_stat(stat_t *_stat_t)
@@ -228,16 +259,48 @@ void reset_stat(stat_t *_stat_t)
 
 void sig_send_stat(uint8_t id_var, stat_t *_stat_t)
 {
-  payload_t frame;
+  stat_payload_t frame;
   char buffer[30];
   // init var
   memset(&frame, 0, sizeof(frame));
   // set frame field
-  frame.msg_type = 0x01;
+  frame.msg_type = MSG_T_STAT;
   frame.id_var   = id_var;
   frame.var_max  = bswap_16(_stat_t->max);
   frame.var_avg  = bswap_16(_stat_t->avg);
   frame.var_min  = bswap_16(_stat_t->min);
+  frame.var_inst = bswap_16(_stat_t->val);
+  // format hex string (ex : 0101fe5ec8990000...)
+  strcpy_P(buffer, PSTR(""));
+  uint8_t i = 0;
+  char digits[3];
+  do
+  { 
+    sprintf(digits, "%02x", frame.byte[i]);
+    strcat(buffer, digits);
+  } while(++i < sizeof(frame)); 
+  // send command
+  fprintf_P(&modem_out, PSTR("AT$RAW=%s\r"), buffer);
+  // time to flush tx buffer
+  delay_idle(50);
+  // debug message
+  if (debug_mode) {
+    fprintf_P(&console_out, PSTR("send \"AT$RAW=%s\"\r\n"), buffer);
+    delay_idle(50);
+  }
+}
+
+void sig_send_index(uint8_t id_var, uint32_t index_1, uint32_t index_2)
+{
+  index_payload_t frame;
+  char buffer[30];
+  // init var
+  memset(&frame, 0, sizeof(frame));
+  // set frame field
+  frame.msg_type = MSG_T_INDEX;
+  frame.id_var   = id_var;
+  frame.index_1  = bswap_32(index_1);
+  frame.index_2  = bswap_32(index_2);
   // format hex string (ex : 0101fe5ec8990000...)
   strcpy_P(buffer, PSTR(""));
   uint8_t i = 0;
