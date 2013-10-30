@@ -188,10 +188,7 @@ void setup()
 void loop()
 { 
   // read U on shunt
-  int16_t _u_mv = ads1015.readADC_Differential_0_1();
-  // two's complement for 12 bits
-  if (_u_mv >= 0x0800)
-    _u_mv = - ((~_u_mv & 0x07FF) + 1);
+  int16_t _u_mv = ads1015.readADC_Differential_2_3();
   // compute _i in ua, current in 0R025 resistor ()
   // _u is : 1 bit -> 0.125 mv
   int32_t _i_ua =  (int32_t(_u_mv) * 0.125) * 1000 / 0.025;
